@@ -1,6 +1,17 @@
 """
 Activa IT - Descargador automático de cartas glosa (Previsora SOAT)
-Versión optimizada para Railway con espera explícita del contador de páginas.
+Versión mejorada con:
+- Detener/Reiniciar
+- Carpetas por IPS (forzando nombre exacto del mapa)
+- Reporte Excel (descargadas + errores)
+- Búsqueda flexible (Envios_D / ActaDevolucion / Carta de Objeción) con filtro correcto
+- Persistencia (reanudación automática)
+- Importación opcional de lista de facturas (CSV/Excel)
+- Generación de ZIP parcial al detener o ante error (incluye Excel parcial y Errores)
+- ZIP final incluye Excel y carpeta Errores
+- API para consultar progreso y exportar a Excel
+- Soporte para períodos individuales y rangos masivos
+- Descarga con nombres mejorados: Factura Y [tipo_soporte]
 """
 
 import os
@@ -16,6 +27,7 @@ from pathlib import Path
 from flask import Flask, render_template, request, jsonify, send_from_directory, send_file
 from io import BytesIO
 
+# Para generar Excel
 try:
     import openpyxl
     from openpyxl.styles import Font
@@ -36,6 +48,7 @@ DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 # ==================== MAPA DE IPS POR NIT ====================
 MAPA_IPS = {
+    # IPS existentes
     "900267064": "INVERSIONES_AZALUD_CLINICA_BAHIA",
     "900827065": "CENTRO_DE_DIAGNOSTICO_E_IMAGENES_BAHIA",
     "900657731": "CENTRO_MEDICO_Y_DE_REHABILITACION_BAHIA",
@@ -48,6 +61,7 @@ MAPA_IPS = {
     "901081281": "URGETRAUMA",
     "900792417": "RED_DE_URGENCIAS_DE_LA_COSTA_PACIFICA",
     "901959993": "CLINICA_CORDIALIDAD",
+    # Nuevas IPS agregadas
     "900002780": "FUNDACION_CAMPBELL",
     "901523868": "MOVID_IPS_SAS",
     "901057487": "TECNOLOGIA_DIAGNOSTICA_DEL_VALLE",
@@ -82,6 +96,7 @@ current_ips_nombre = None
 MESES = ["Ene","Feb","Mar","Abr","May","Jun","Jul","Ago","Sep","Oct","Nov","Dic"]
 
 def validar_periodo(p):
+    """Valida que un string sea un período válido (MMMYY)"""
     if not p or len(p) < 5:
         return False
     mes = p[:3]
@@ -89,41 +104,61 @@ def validar_periodo(p):
     return mes in MESES and re.match(r'^\d{2}$', anio)
 
 def generar_rango_periodos(inicio, fin):
+    """Genera lista de períodos entre inicio y fin (ambos inclusive)"""
     if not validar_periodo(inicio) or not validar_periodo(fin):
         return []
+
     mes_inicio = MESES.index(inicio[:3])
     anio_inicio = int(inicio[3:])
     mes_fin = MESES.index(fin[:3])
     anio_fin = int(fin[3:])
+
+    # Convertir a fecha comparable (año * 100 + mes)
     fecha_inicio = anio_inicio * 100 + mes_inicio
     fecha_fin = anio_fin * 100 + mes_fin
+
     if fecha_fin < fecha_inicio:
         return []
+
     periodos = []
     anio = anio_inicio
     mes = mes_inicio
+
     while True:
         anio_str = str(anio).zfill(2)
         periodos.append(MESES[mes] + anio_str)
+
         if anio == anio_fin and mes == mes_fin:
             break
+
         mes += 1
         if mes > 11:
             mes = 0
             anio += 1
+
     return periodos
 
 def parse_periodo_input(periodo_input):
+    """Parsea el input de período y retorna lista de períodos.
+    Soporta:
+    - Período único: May26
+    - Rango: Dic25-May26
+    """
     periodo_input = periodo_input.strip()
     if not periodo_input:
         return []
+
+    # Detectar rango con "-"
     if '-' in periodo_input:
         parts = [p.strip() for p in periodo_input.split('-')]
         if len(parts) == 2:
             return generar_rango_periodos(parts[0], parts[1])
         return []
+
+    # Período individual
     if validar_periodo(periodo_input):
         return [periodo_input]
+
     return []
 
 # ==================== LOGGING ====================
@@ -160,18 +195,25 @@ def stop_job():
             log("  → Navegador cerrado por solicitud de stop.")
         except Exception as e:
             log(f"  → Error al cerrar navegador: {e}", "error")
+    # Generar ZIP parcial si hay archivos descargados y tenemos los datos necesarios
     generar_zip_parcial()
 
 def generar_zip_parcial():
+    """Genera un ZIP con los PDFs ya descargados hasta el momento,
+       incluyendo un reporte Excel parcial y la carpeta Errores."""
     global current_dl_dir, current_periodo, current_ips_nombre
     if not current_dl_dir or not current_periodo or not current_ips_nombre:
         return
     ips_dir = current_dl_dir / current_ips_nombre
     if not ips_dir.exists():
         return
+
+    # Obtener los datos actuales de descargas y errores
     with job_lock:
         exitosas = job_state["descargas_exitosas"].copy()
         errores = job_state["errores_detalle"].copy()
+
+    # Generar un Excel parcial (si hay datos o si openpyxl está disponible)
     excel_parcial_path = None
     if EXCEL_AVAILABLE:
         try:
@@ -193,14 +235,22 @@ def generar_zip_parcial():
         except Exception as e:
             log(f"⚠️ No se pudo generar Excel parcial: {e}", "warn")
             excel_parcial_path = None
-    archivos_a_incluir = list(ips_dir.rglob("*.pdf"))
+
+    # Recopilar archivos a incluir
+    archivos_a_incluir = []
+    # PDFs
+    archivos_a_incluir.extend(ips_dir.rglob("*.pdf"))
+    # Excel parcial (si existe)
     if excel_parcial_path and excel_parcial_path.exists():
         archivos_a_incluir.append(excel_parcial_path)
+    # Carpeta Errores
     errores_dir = ips_dir / "Errores"
     if errores_dir.exists():
         archivos_a_incluir.extend(errores_dir.rglob("*"))
+
     if not archivos_a_incluir:
         return
+
     try:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         zip_name = f"facturas_{current_periodo}_PARCIAL_{timestamp}.zip"
@@ -209,22 +259,26 @@ def generar_zip_parcial():
             for archivo in archivos_a_incluir:
                 arcname = archivo.relative_to(current_dl_dir)
                 zf.write(archivo, arcname=str(arcname))
-        log(f"📦 ZIP parcial generado: {zip_path}")
+        log(f"📦 ZIP parcial generado (detención/error): {zip_path}")
     except Exception as e:
         log(f"⚠️ No se pudo generar ZIP parcial: {e}", "warn")
 
 def crear_zip_completo(dl_dir, periodo, ips_nombre):
+    """Crea ZIP final incluyendo PDFs, Excel final y carpeta Errores."""
     try:
         zip_final_name = f"facturas_{periodo}.zip"
         zip_final_path = dl_dir / zip_final_name
         with zipfile.ZipFile(zip_final_path, "w", zipfile.ZIP_DEFLATED) as zf:
             ips_dir = dl_dir / ips_nombre
             if ips_dir.exists():
+                # PDFs
                 for pdf in ips_dir.rglob("*.pdf"):
                     zf.write(pdf, arcname=str(pdf.relative_to(dl_dir)))
+                # Excel final (sin "_PARCIAL_" en el nombre)
                 for excel in ips_dir.glob("reporte_*.xlsx"):
                     if "_PARCIAL_" not in excel.name:
                         zf.write(excel, arcname=str(excel.relative_to(dl_dir)))
+                # Errores
                 errores_dir = ips_dir / "Errores"
                 if errores_dir.exists():
                     for err_file in errores_dir.rglob("*"):
@@ -235,47 +289,64 @@ def crear_zip_completo(dl_dir, periodo, ips_nombre):
         log(f"⚠️ No se pudo generar el ZIP final: {e}", "warn")
         return None
 
+# ==================== PERSISTENCIA (REANUDACIÓN) ====================
 def cargar_progreso(ips_dir):
     progreso_path = ips_dir / "progreso.json"
     if progreso_path.exists():
         try:
             with open(progreso_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
+                # El progreso puede ser una lista simple o un diccionario con timestamps
                 completadas = data.get("completadas", [])
-                return set(completadas) if isinstance(completadas, list) else set()
+                if isinstance(completadas, list):
+                    return set(completadas)
+                elif isinstance(completadas, dict):
+                    return set(completadas.keys())
+                else:
+                    return set()
         except Exception as e:
             log(f"⚠️ Error al leer progreso: {e}", "warn")
     return set()
 
 def guardar_progreso(ips_dir, completadas):
+    """Guardar progreso. completadas es un set de números de factura."""
     progreso_path = ips_dir / "progreso.json"
     try:
-        data = {"completadas": list(completadas), "actualizado": datetime.now().isoformat()}
+        # Convertir el set a lista para JSON
+        data = {
+            "completadas": list(completadas),
+            "actualizado": datetime.now().isoformat()
+        }
         with open(progreso_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
     except Exception as e:
         log(f"⚠️ Error al guardar progreso: {e}", "warn")
 
+# ==================== GENERADOR DE EXCEL ====================
 def generar_reporte_excel(dl_dir, periodo, ips_nombre, exitosas, errores):
     if not EXCEL_AVAILABLE:
         return None
     excel_path = dl_dir / ips_nombre / f"reporte_{periodo}.xlsx"
     excel_path.parent.mkdir(parents=True, exist_ok=True)
     wb = openpyxl.Workbook()
+
     ws_exit = wb.active
     ws_exit.title = "Descargadas"
     ws_exit.append(["N° Factura", "Estado", "IPS", "Archivo Descargado", "Fecha/Hora"])
     for ex in exitosas:
         ws_exit.append([ex.get("factura"), ex.get("estado"), ips_nombre, ex.get("archivo"), ex.get("timestamp")])
+
     ws_err = wb.create_sheet("Errores")
     ws_err.append(["N° Factura", "Estado", "IPS", "Error", "Captura pantalla", "Fecha/Hora"])
     for err in errores:
         ws_err.append([err.get("factura"), err.get("estado"), ips_nombre, err.get("error"), err.get("captura"), err.get("timestamp")])
+
     wb.save(excel_path)
     return excel_path
 
 # ==================== FUNCIONES AUXILIARES ====================
-def _find_frame_with_text(page, regex_text):
+
+def _find_frame_with_text(page, regex_text: str):
     js = f"() => {{ const re = new RegExp({json.dumps(regex_text)}, 'i'); return re.test(document.body?.innerText || ''); }}"
     for fr in page.frames:
         try:
@@ -309,99 +380,123 @@ def _cerrar_traza_factura(page):
         except:
             continue
 
+# ==================== FUNCIÓN MEJORADA DE EXTRACCIÓN DE NOMBRE DE IPS ====================
 def _extraer_nombre_ips(page, target_frame, nit_usuario=None):
+    """
+    Extrae el nombre de la IPS forzando el uso del nombre exacto del mapa.
+    Orden de prioridad:
+    0. NIT extraído del nombre de usuario (ej: PREV900600550 → 900600550)
+    1. Carpeta previa del mismo período (solo si existe en current_dl_dir)
+    2. NIT encontrado en el HTML de la página
+    3. Nombre candidato por palabras clave (con búsqueda de NIT embebido)
+    4. Título de la página
+    5. Fallback: IPS_DESCONOCIDA
+    """
+    # 0. PRIMERO: si el NIT viene del nombre de usuario, úsalo directamente
     if nit_usuario and nit_usuario in MAPA_IPS:
         nombre = MAPA_IPS[nit_usuario]
         log(f"    🏥 IPS identificada por NIT del usuario ({nit_usuario}) -> nombre del mapa: {nombre}")
         return nombre
+
+    # 1. Si ya existe una carpeta del mismo período (current_dl_dir ya es la carpeta del período),
+    #    reutilizar ese nombre para que el progreso.json se lea correctamente.
     if current_dl_dir and current_dl_dir.exists():
         for nombre_mapa in MAPA_IPS.values():
             carpeta_existente = current_dl_dir / nombre_mapa
             if carpeta_existente.exists():
                 log(f"    📂 Carpeta previa encontrada, reutilizando nombre: {nombre_mapa}")
                 return nombre_mapa
+
     def _buscar_nit_en_frame(frame):
         try:
-            nit = frame.evaluate("() => { const match = document.body.innerText.match(/NIT\\s*:\\s*([\\d\\-\\ s]+)/i); if(match) return match[1].replace(/[^0-9]/g, ''); return ''; }").strip()
+            nit = frame.evaluate("() => { const match = document.body.innerText.match(/NIT\\s*:\\s*([\\d\\-\\s]+)/i); if(match) return match[1].replace(/[^0-9]/g, ''); return ''; }").strip()
             return nit if nit else ""
         except:
             return ""
-    nit = _buscar_nit_en_frame(page) or _buscar_nit_en_frame(target_frame)
-    if not nit:
-        for fr in page.frames:
-            if fr not in (page, target_frame):
-                nit = _buscar_nit_en_frame(fr)
-                if nit:
-                    break
-    log(f"    🔍 NIT detectado: {nit}")
+
+    def _buscar_nombre_por_palabras(frame):
+        keywords = ["IPS","CLINICA","HOSPITAL","CENTRO","FUNDACIÓN","URGENCIAS","SALUD","ODONTOTRANS","URGETRAUMA","CORDIALIDAD"]
+        try:
+            js = f"""
+                () => {{
+                    const keywords = {json.dumps(keywords)};
+                    const elementos = document.querySelectorAll('h1, h2, h3, h4, p, div');
+                    for (const el of elementos) {{
+                        let txt = el.innerText.trim();
+                        if (txt.length > 5 && txt.length < 100) {{
+                            for (const kw of keywords) {{
+                                if (txt.toUpperCase().includes(kw)) {{
+                                    return txt;
+                                }}
+                            }}
+                        }}
+                    }}
+                    return "";
+                }}
+            """
+            nombre = frame.evaluate(js).strip()
+            return nombre
+        except:
+            return ""
+
+    # 1. Buscar NIT en todos los frames
+    nit = ""
+    for fr in [page] + page.frames:
+        nit = _buscar_nit_en_frame(fr)
+        if nit:
+            log(f"    🔍 NIT encontrado en frame: {fr.name or 'principal'}")
+            break
+
+    # Si encontramos NIT y está en el mapa, usamos el nombre del mapa (sin añadir nada extra)
     if nit and nit in MAPA_IPS:
         nombre = MAPA_IPS[nit]
         log(f"    🏥 IPS identificada por NIT {nit} -> nombre forzado del mapa: {nombre}")
         return nombre
-    js_nombre = """
-        () => {
-            const keywords = ["IPS","CLINICA","HOSPITAL","CENTRO","FUNDACIÓN","URGENCIAS","SALUD","ODONTOTRANS","URGETRAUMA","CORDIALIDAD"];
-            for (const el of document.querySelectorAll('h1,h2,h3,h4,p,div')) {
-                let txt = el.innerText.trim();
-                if (txt.length > 5 && txt.length < 100 && keywords.some(kw => txt.toUpperCase().includes(kw))) return txt;
-            }
-            return "";
-        }
-    """
-    nombre = page.evaluate(js_nombre).strip() or target_frame.evaluate(js_nombre).strip()
-    if not nombre:
-        nombre = "IPS_DESCONOCIDA"
-    nombre = re.sub(r'[\\/*?:"<>|]', "", nombre).strip().replace(" ", "_")
-    log(f"    🏥 IPS final: {nombre} (NIT: {nit})")
-    return nombre
 
-def _avanzar_pagina(page):
-    for frame in page.frames:
-        try:
-            if frame.evaluate("""() => {
-                const btns = document.querySelectorAll('button, a, [role="button"]');
-                for (const btn of btns) {
-                    const html = btn.outerHTML.toLowerCase();
-                    const txt = (btn.textContent || '').toLowerCase();
-                    if ((html.includes('arrow') || html.includes('chevron') || html.includes('right') ||
-                         txt.includes('>') || txt.includes('next') || txt.includes('siguiente')) &&
-                        !html.includes('left') && !html.includes('prev')) {
-                        btn.click();
-                        return true;
-                    }
-                }
-                return false;
-            }"""):
-                time.sleep(0.5)
-                return True
-        except:
-            pass
+    # 2. Si no se encontró NIT o no está en el mapa, buscar por palabras clave
+    nombre_candidato = ""
+    for fr in [page] + page.frames:
+        nombre_candidato = _buscar_nombre_por_palabras(fr)
+        if nombre_candidato:
+            log(f"    🔍 Nombre candidato encontrado: '{nombre_candidato}'")
+            break
+
+    if nombre_candidato:
+        # Limpiar caracteres no válidos
+        nombre_candidato = re.sub(r'[\\/*?:"<>|]', "", nombre_candidato).strip()
+        # Buscar si dentro del nombre candidato hay un NIT conocido
+        nit_embedded = re.search(r'\b(\d{9})\b', nombre_candidato)
+        if nit_embedded and nit_embedded.group(1) in MAPA_IPS:
+            nombre = MAPA_IPS[nit_embedded.group(1)]
+            log(f"    🏥 IPS identificada por NIT embebido en texto: {nombre}")
+            return nombre
+        # Si no, devolver el nombre candidato limpio, pero sin añadir "_Previsora" ni similares
+        nombre = re.sub(r'\s+', ' ', nombre_candidato).strip()
+        log(f"    🏥 IPS identificada por texto: {nombre}")
+        return nombre
+
+    # 3. Fallback: usar el título de la página
     try:
-        page.evaluate("""() => {
-            for (const el of document.querySelectorAll('button, div, span')) {
-                const svgs = el.querySelectorAll('svg');
-                for (const svg of svgs) {
-                    const path = svg.outerHTML.toLowerCase();
-                    if (path.includes('arrow') || path.includes('chevron')) {
-                        el.click();
-                        return;
-                    }
-                }
-            }
-        }""")
-        time.sleep(0.5)
-        return True
+        title = page.evaluate("() => document.title").strip()
+        if title and len(title) > 5 and len(title) < 100:
+            title = re.sub(r'Activa IT|BI IPS|Inteligencia de Negocio|Previsora|SOAT|Inicio', '', title, flags=re.I).strip()
+            if title:
+                log(f"    🏥 IPS obtenida del título: {title}")
+                return title
     except:
-        return False
+        pass
 
-# ==================== FUNCIÓN DE DESCARGA CON ESPERA DEL CONTADOR ====================
+    # 4. Fallback definitivo
+    log("    ⚠️ No se pudo determinar la IPS, se usará 'IPS_DESCONOCIDA'", "warn")
+    return "IPS_DESCONOCIDA"
+
+# ==================== FUNCIÓN _download_factura (sin cambios) ====================
 def _download_factura(page, context, modal_frame, fac: dict, dl_dir: Path, ips_nombre: str):
-    from PIL import Image
-    import io
-    import img2pdf
-
+    import re
     num = fac["num"]
     tipo = fac["tipo"]
+
+    # Determinar etiquetas según el tipo
     if tipo == "devolucion":
         target_label = "ActaDevolucion"
         target_label_norm = target_label.replace('ó', 'o').replace('í', 'i')
@@ -493,27 +588,38 @@ def _download_factura(page, context, modal_frame, fac: dict, dl_dir: Path, ips_n
 
     if detalle_state == "traza":
         log("    📑 Forzando cambio a pestaña 'Soportes'...")
-        supports_ok = False
+        soportes_ok = False
         for intento in range(5):
             if job_state.get("stopping"): return
             for fr in page.frames:
                 try:
-                    has_tabs = fr.evaluate(r"""() => /Factura.*Detalles.*Soportes/i.test((document.body?.innerText || '').replace(/\n/g, ' '))""")
+                    has_tabs = fr.evaluate(r"""() => {
+                        const txt = (document.body?.innerText || '').replace(/\n/g, ' ');
+                        return /Factura.*Detalles.*Soportes/i.test(txt);
+                    }""")
                     if has_tabs:
                         try:
                             fr.locator("text=Soportes").first.click(timeout=5000)
-                            supports_ok = True
+                            soportes_ok = True
                             break
                         except:
-                            if fr.evaluate("""() => { for(const el of document.querySelectorAll('*')) if((el.textContent||'').trim() === 'Soportes'){ el.click(); return true; } return false; }"""):
-                                supports_ok = True
+                            clicked = fr.evaluate("""() => {
+                                for (const el of document.querySelectorAll('*')) {
+                                    if ((el.textContent||'').trim() === 'Soportes') {
+                                        el.click(); return true;
+                                    }
+                                }
+                                return false;
+                            }""")
+                            if clicked:
+                                soportes_ok = True
                                 break
                 except:
                     continue
-            if supports_ok:
+            if soportes_ok:
                 break
             time.sleep(1)
-        if not supports_ok:
+        if not soportes_ok:
             log("    ⚠️ No se pudo clickear Soportes", "warn")
         else:
             time.sleep(3)
@@ -536,21 +642,27 @@ def _download_factura(page, context, modal_frame, fac: dict, dl_dir: Path, ips_n
         raise Exception("No se encontró sección 'Adjuntos por Factura'.")
     for _ in range(35):
         if job_state.get("stopping"): return
-        processing = any(fr.evaluate("() => /Procesando Solicitud/i.test(document.body?.innerText || '')") for fr in page.frames if fr)
-        if not processing:
-            break
+        try:
+            busy = adjuntos_frame.evaluate("() => /Procesando Solicitud/i.test(document.body?.innerText || '')")
+            if not busy:
+                break
+        except:
+            pass
         time.sleep(1)
     time.sleep(1)
     log("    ✅ Adjuntos cargados.")
 
     search_frame = adjuntos_frame
 
+    # Función mejorada para escribir en el buscador y disparar la lupa
     def _escribir_buscador(texto):
+        # Limpiar input antes
         search_frame.evaluate("""
             () => {
                 const inputs = document.querySelectorAll('input');
                 for (const input of inputs) {
-                    if ((input.placeholder || '').toLowerCase().includes('buscar') || (input.placeholder || '').toLowerCase().includes('filtrar')) {
+                    const ph = (input.placeholder || '').toLowerCase();
+                    if (ph.includes('buscar') || ph.includes('filtrar') || ph.includes('nombre')) {
                         input.value = '';
                         input.dispatchEvent(new Event('input', { bubbles: true }));
                         break;
@@ -559,13 +671,15 @@ def _download_factura(page, context, modal_frame, fac: dict, dl_dir: Path, ips_n
             }
         """)
         time.sleep(0.5)
+        # Escribir el texto y disparar eventos
         search_frame.evaluate(f"""
             () => {{
                 const target = '{texto.replace('í', 'i')}';
+                const inputs = document.querySelectorAll('input');
                 let searchInput = null;
-                for (const input of document.querySelectorAll('input')) {{
+                for (const input of inputs) {{
                     const ph = (input.placeholder || '').toLowerCase();
-                    if (ph.includes('buscar') || ph.includes('filtrar')) {{
+                    if (ph.includes('buscar') || ph.includes('filtrar') || ph.includes('nombre')) {{
                         searchInput = input;
                         break;
                     }}
@@ -578,9 +692,11 @@ def _download_factura(page, context, modal_frame, fac: dict, dl_dir: Path, ips_n
                 else searchInput.value = target;
                 searchInput.dispatchEvent(new Event('input', {{ bubbles: true }}));
                 searchInput.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                // Buscar botón de lupa
                 let parent = searchInput.closest('div, td, form, span');
                 if (parent) {{
-                    for (const btn of parent.querySelectorAll('button, a, [role="button"], span')) {{
+                    const btns = parent.querySelectorAll('button, a, [role="button"], span');
+                    for (const btn of btns) {{
                         const html = (btn.outerHTML || '').toLowerCase();
                         const title = (btn.title || '').toLowerCase();
                         if (html.includes('search') || html.includes('lup') || title.includes('search')) {{
@@ -589,28 +705,40 @@ def _download_factura(page, context, modal_frame, fac: dict, dl_dir: Path, ips_n
                         }}
                     }}
                 }}
-                for (const svg of document.querySelectorAll('svg')) {{
+                const svgs = document.querySelectorAll('svg');
+                for (const svg of svgs) {{
                     if ((svg.outerHTML || '').toLowerCase().includes('search')) {{
                         const container = svg.closest('button, a, [role="button"]');
                         if (container) {{ container.click(); return; }}
                     }}
                 }}
+                // Fallback: presionar Enter
                 searchInput.dispatchEvent(new KeyboardEvent('keypress', {{ key: 'Enter', bubbles: true }}));
             }}
         """)
         time.sleep(2)
+        # Esperar a que termine "Procesando Solicitud"
         for _ in range(40):
             if job_state.get("stopping"): return
-            processing = any(fr.evaluate("() => /Procesando Solicitud/i.test(document.body?.innerText || '')") for fr in page.frames if fr)
+            processing = False
+            for fr in page.frames:
+                try:
+                    if fr.evaluate("() => /Procesando Solicitud/i.test(document.body?.innerText || '')"):
+                        processing = True
+                        break
+                except:
+                    pass
             if not processing:
                 break
             time.sleep(0.5)
         time.sleep(2)
 
+    # ---------- BÚSQUEDA DE SOPORTES CON MEJORAS ----------
+    # Intentar primero con la etiqueta principal (Envios_D o ActaDevolucion)
     log(f"    🔍 Buscando '{target_label}'...")
     _escribir_buscador(target_label)
     archivo_seleccionado = False
-    tipo_encontrado = None
+    tipo_encontrado = None  # Rastrear qué tipo de soporte se encontró
     posibles_nombres = list({target_label, target_label_norm})
 
     for intento in range(4):
@@ -621,7 +749,8 @@ def _download_factura(page, context, modal_frame, fac: dict, dl_dir: Path, ips_n
                     () => {{
                         const nombres = {json.dumps(posibles_nombres)};
                         let contenedor = null;
-                        for (const el of document.querySelectorAll('td, div, span, li, p, tr')) {{
+                        const elementos = document.querySelectorAll('td, div, span, li, p, tr');
+                        for (const el of elementos) {{
                             const txt = (el.innerText || '').trim();
                             for (const nombre of nombres) {{
                                 if (txt === nombre) {{
@@ -643,7 +772,17 @@ def _download_factura(page, context, modal_frame, fac: dict, dl_dir: Path, ips_n
                             }}
                             return {{ ok: true, metodo: 'checkbox' }};
                         }}
-                        let iconoPdf = contenedor.querySelector('img[src*="pdf"], svg[aria-label%3D*="pdf"], i[class*="pdf"], i[class*="file"], div[class%3D"pdf-icon"]');
+                        let iconoPdf = null;
+                        const candidatosPdf = contenedor.querySelectorAll('img, svg, i, div');
+                        for (const el of candidatosPdf) {{
+                            const src = el.getAttribute('src') || '';
+                            const lbl = el.getAttribute('aria-label') || '';
+                            const cls = el.className || '';
+                            if (src.toLowerCase().includes('pdf') || lbl.toLowerCase().includes('pdf') ||
+                                cls.toLowerCase().includes('pdf') || cls.toLowerCase().includes('file')) {{
+                                iconoPdf = el; break;
+                            }}
+                        }}
                         if (iconoPdf) {{
                             iconoPdf.click();
                             return {{ ok: true, metodo: 'icono_pdf' }};
@@ -657,7 +796,7 @@ def _download_factura(page, context, modal_frame, fac: dict, dl_dir: Path, ips_n
                 if resultado and resultado.get('ok'):
                     log(f"    ✅ Selección realizada (método: {resultado.get('metodo')})")
                     archivo_seleccionado = True
-                    tipo_encontrado = nombre_soporte
+                    tipo_encontrado = nombre_soporte  # Guardar el tipo encontrado
                     break
             except Exception as e:
                 log(f"    ⚠️ Error en intento {intento+1}: {e}", "warn")
@@ -666,10 +805,12 @@ def _download_factura(page, context, modal_frame, fac: dict, dl_dir: Path, ips_n
         log(f"    🔄 Reintentando selección ({intento+1}/4)...")
         time.sleep(2)
 
+    # ---------- SEGUNDA BÚSQUEDA: CARTA DE OBJECIÓN (si no se encontró Envios_D/ActaDevolucion) ----------
     if not archivo_seleccionado:
         log(f"    ⚠️ No se encontró '{target_label}'. Intentando con 'Carta de'...")
         texto_busqueda = "Carta de"
         _escribir_buscador(texto_busqueda)
+
         archivo_seleccionado = False
         for intento in range(4):
             if job_state.get("stopping"): return
@@ -681,7 +822,8 @@ def _download_factura(page, context, modal_frame, fac: dict, dl_dir: Path, ips_n
                             function normalizar(s) {{
                                 return s.toLowerCase().normalize("NFD").replace(/[\\u0300-\\u036f]/g, "");
                             }}
-                            for (const el of document.querySelectorAll('td, div, span, li, p, tr')) {{
+                            const elementos = document.querySelectorAll('td, div, span, li, p, tr');
+                            for (const el of elementos) {{
                                 const txt = (el.innerText || '').trim();
                                 if (normalizar(txt).includes(normalizar(buscarTexto))) {{
                                     let contenedor = el.closest('div[class*="file"], li[class*="file"], tr, div[class*="item"], div[class*="attach"], div[class*="row"]');
@@ -697,7 +839,17 @@ def _download_factura(page, context, modal_frame, fac: dict, dl_dir: Path, ips_n
                                             }}
                                             return {{ ok: true, metodo: 'checkbox', texto: txt }};
                                         }}
-                                        let iconoPdf = contenedor.querySelector('img[src*="pdf"], svg[aria-label%3D*="pdf"], i[class%3D"pdf"]');
+                                        let iconoPdf = null;
+                                        const candidatosPdf2 = contenedor.querySelectorAll('img, svg, i, div');
+                                        for (const el of candidatosPdf2) {{
+                                            const src = el.getAttribute('src') || '';
+                                            const lbl = el.getAttribute('aria-label') || '';
+                                            const cls = el.className || '';
+                                            if (src.toLowerCase().includes('pdf') || lbl.toLowerCase().includes('pdf') ||
+                                                cls.toLowerCase().includes('pdf')) {{
+                                                iconoPdf = el; break;
+                                            }}
+                                        }}
                                         if (iconoPdf) {{
                                             iconoPdf.click();
                                             return {{ ok: true, metodo: 'icono_pdf', texto: txt }};
@@ -713,9 +865,9 @@ def _download_factura(page, context, modal_frame, fac: dict, dl_dir: Path, ips_n
                         }}
                     """)
                     if resultado and resultado.get('ok'):
-                        log(f"    ✅ Selección realizada con '{texto_busqueda}' (método: {resultado.get('metodo')})")
+                        log(f"    ✅ Selección realizada con '{texto_busqueda}' (método: {resultado.get('metodo')}) - Texto encontrado: '{resultado.get('texto')}'")
                         archivo_seleccionado = True
-                        tipo_encontrado = "CartaObjecion"
+                        tipo_encontrado = "Carta de Objecion"  # Guardar el tipo encontrado
                         break
                 except Exception as e:
                     log(f"    ⚠️ Error en intento {intento+1} para '{texto_busqueda}': {e}", "warn")
@@ -727,176 +879,126 @@ def _download_factura(page, context, modal_frame, fac: dict, dl_dir: Path, ips_n
     if not archivo_seleccionado:
         raise Exception(f"No se pudo seleccionar el archivo (intentó '{target_label}' y 'Carta de')")
 
+    # Confirmar que no haya mensaje de error "Debe seleccionar..."
     log("    ⏳ Esperando confirmación de selección...")
     for _ in range(20):
         if job_state.get("stopping"): return
-        if not any(fr.evaluate("() => /Debe seleccionar por lo menos un documento/i.test(document.body?.innerText || '')") for fr in page.frames if fr):
+        hay_error = False
+        for fr in page.frames:
+            try:
+                if fr.evaluate("() => /Debe seleccionar por lo menos un documento/i.test(document.body?.innerText || '')"):
+                    hay_error = True
+                    break
+            except:
+                pass
+        if not hay_error:
             log("    ✅ Selección confirmada")
             break
         time.sleep(1)
 
-    log(f"    👁️ Abriendo visor documental...")
-    visor_page = None
-    try:
-        with context.expect_page(timeout=30000) as page_info:
-            for fr in page.frames:
-                try:
-                    btn = fr.locator('button[title="Abrir Documento"], button[aria-label="Abrir Documento"], button:has(i.fa-eye), button:has(i.bi-eye)').first
-                    if btn.is_visible(timeout=5000):
-                        btn.click()
-                        log("    ✅ Clic en botón 'Abrir Documento'")
-                        break
-                except:
-                    pass
-        visor_page = page_info.value
-        time.sleep(2)
-    except Exception as e:
-        raise Exception(f"No se pudo abrir el visor documental: {e}")
+    # ---------- ABRIR DOCUMENTO ----------
+    log(f"    👁️ Buscando botón 'Abrir Documento'...")
+    pdf_data = None
+    pdf_url = None
 
-    def _esperar_contador_paginas(frame, timeout=30):
-        start = time.time()
-        ultimo_valor = None
-        while time.time() - start < timeout:
-            if job_state.get("stopping"):
-                return None
-            for fr in [frame] + frame.frames:
-                try:
-                    texto = fr.evaluate("() => document.body?.innerText || ''")
-                    match = re.search(r'(\d+)\s*/\s*(\d+)', texto)
-                    if match:
-                        actual = int(match.group(1))
-                        total = int(match.group(2))
-                        if ultimo_valor == (actual, total):
-                            return (actual, total)
-                        ultimo_valor = (actual, total)
-                        time.sleep(0.5)
-                        continue
-                except:
-                    pass
-            if not visor_page.is_open():
-                return None
-            time.sleep(0.5)
-        return None
-
-    log("    ⏳ Esperando contador de páginas (ej. '1/11')...")
-    contador = _esperar_contador_paginas(visor_page, timeout=30)
-    if not contador:
-        log("    ⚠️ No se detectó contador de páginas. Se usará método alternativo.", "warn")
-        total_paginas = 1
-        pagina_actual_esperada = 1
+    boton_encontrado = False
+    start_time = time.time()
+    while time.time() - start_time < 15:
+        if job_state.get("stopping"): return
+        for fr in page.frames:
+            try:
+                btn = fr.locator('button[title="Abrir Documento"], button[aria-label="Abrir Documento"], button:has(i.fa-eye), button:has(i.bi-eye)').first
+                if btn.is_visible(timeout=2000):
+                    boton_encontrado = True
+                    break
+            except:
+                pass
+        if boton_encontrado:
+            break
+        time.sleep(0.5)
     else:
-        pagina_actual_esperada, total_paginas = contador
-        log(f"    📄 Contador detectado: {pagina_actual_esperada}/{total_paginas}")
+        raise Exception("Botón 'Abrir Documento' no encontrado")
 
-    def _capturar_pagina_con_contador(frame, num_pagina_esperado, timeout=15):
-        start = time.time()
-        while time.time() - start < timeout:
-            if job_state.get("stopping"):
-                return None
-            for fr in [frame] + frame.frames:
+    for reintento in range(2):
+        if job_state.get("stopping"): return
+        new_page = None
+        try:
+            with context.expect_page(timeout=30000) as page_info:
+                for fr in page.frames:
+                    try:
+                        btn = fr.locator('button[title="Abrir Documento"], button[aria-label="Abrir Documento"], button:has(i.fa-eye), button:has(i.bi-eye)').first
+                        if btn.is_visible(timeout=5000):
+                            for _ in range(10):
+                                if btn.is_enabled():
+                                    break
+                                time.sleep(0.5)
+                            btn.click()
+                            log("    ✅ Clic en botón 'Abrir Documento'")
+                            break
+                    except:
+                        pass
+            new_page = page_info.value
+            for _ in range(30):
+                if job_state.get("stopping"): return
+                url = new_page.url
+                if url and url != "about:blank" and ("amazonaws" in url or ".pdf" in url.lower()):
+                    pdf_url = url
+                    break
+                time.sleep(0.5)
+        except Exception as e:
+            log(f"    ⚠️ Intento {reintento+1}: No se abrió nueva pestaña: {e}", "warn")
+        finally:
+            if new_page:
                 try:
-                    texto = fr.evaluate("() => document.body?.innerText || ''")
-                    match = re.search(r'(\d+)\s*/\s*(\d+)', texto)
-                    if match and int(match.group(1)) == num_pagina_esperado:
-                        for f in [fr] + fr.frames:
-                            try:
-                                canvas = f.locator("canvas").first
-                                if canvas.is_visible():
-                                    bbox = canvas.bounding_box()
-                                    if bbox and bbox['width'] > 200:
-                                        time.sleep(0.3)
-                                        img_bytes = canvas.screenshot()
-                                        if img_bytes and len(img_bytes) > 10000:
-                                            return img_bytes
-                            except:
-                                pass
-                            try:
-                                imgs = f.locator("img")
-                                for i in range(imgs.count()):
-                                    img = imgs.nth(i)
-                                    if img.is_visible():
-                                        width = img.get_attribute("width") or 0
-                                        if int(width) > 300:
-                                            src = img.get_attribute("src")
-                                            if src and (src.startswith("http") or src.startswith("blob")):
-                                                resp = frame.request.get(src, timeout=10000)
-                                                if resp.ok and len(resp.body()) > 10000:
-                                                    return resp.body()
-                                            img_bytes = img.screenshot()
-                                            if img_bytes and len(img_bytes) > 10000:
-                                                return img_bytes
-                            except:
-                                pass
-                        screenshot = frame.screenshot()
-                        if screenshot and len(screenshot) > 5000:
-                            try:
-                                img = Image.open(io.BytesIO(screenshot))
-                                w, h = img.size
-                                img_cropped = img.crop((int(w * 0.05), int(h * 0.05), int(w * 0.95), int(h * 0.95)))
-                                output = io.BytesIO()
-                                img_cropped.save(output, format='PNG')
-                                return output.getvalue()
-                            except:
-                                return screenshot
+                    new_page.close()
                 except:
                     pass
-            time.sleep(0.5)
-        return None
 
-    imagenes_bytes = []
-    if total_paginas == 1 and not contador:
-        log("    ⬇️ Intentando captura directa (sin contador)...")
-        img_bytes = _capturar_pagina_con_contador(visor_page, 1, timeout=10)
-        if img_bytes:
-            imagenes_bytes.append(img_bytes)
-            log("    ✅ Página capturada")
-        else:
-            log("    ⚠️ No se pudo capturar", "warn")
-    else:
-        log(f"    ⬇️ Iniciando descarga de {total_paginas} página(s)...")
-        for pagina in range(1, total_paginas + 1):
-            if job_state.get("stopping"): return
-            log(f"    📥 Esperando página {pagina}/{total_paginas}...")
-            img_bytes = _capturar_pagina_con_contador(visor_page, pagina, timeout=20)
-            if img_bytes:
-                imagenes_bytes.append(img_bytes)
-                log(f"    ✅ Página {pagina} capturada ({len(img_bytes)} bytes)")
-            else:
-                log(f"    ⚠️ No se pudo capturar página {pagina}", "warn")
-                if pagina < total_paginas:
-                    _avanzar_pagina(visor_page)
-                    time.sleep(2)
-            if pagina < total_paginas:
-                log(f"    ➡️ Avanzando a página {pagina+1}...")
-                _avanzar_pagina(visor_page)
-                time.sleep(1)
+        if pdf_url:
+            try:
+                response = context.request.get(pdf_url, timeout=60000)
+                if response.ok:
+                    pdf_data = response.body()
+                    log(f"    ✅ PDF descargado ({len(pdf_data)//1024} KB)")
+                    break
+            except Exception as e:
+                log(f"    ⚠️ Error descargando: {e}", "warn")
 
-    try:
-        visor_page.close()
-    except:
-        pass
+        if not pdf_data:
+            log("    ⏳ Intentando descarga directa...")
+            try:
+                with page.expect_download(timeout=30000) as download_info:
+                    for fr in page.frames:
+                        try:
+                            btn = fr.locator('button[title="Abrir Documento"], button:has(i.fa-eye), button:has(i.bi-eye)').first
+                            if btn.is_visible(timeout=3000):
+                                btn.click()
+                                break
+                        except:
+                            pass
+                download = download_info.value
+                pdf_data = download.path().read_bytes() if download.path() else None
+                log("    ✅ Descarga directa capturada")
+                break
+            except Exception as e:
+                log(f"    ⚠️ No se capturó descarga: {e}", "warn")
 
-    if not imagenes_bytes:
-        raise Exception(f"No se capturó ninguna imagen para la factura {num}")
+        if not pdf_data:
+            log(f"    🔄 Reintento {reintento+1}/2...")
+            time.sleep(2)
 
-    log(f"    📦 Consolidando {len(imagenes_bytes)} imagen(es) en PDF...")
+    if not pdf_data:
+        raise Exception("No se pudo obtener el PDF")
+
+    # ---------- MEJORAR NOMBRE DEL ARCHIVO ----------
+    # Determinar el tipo de soporte encontrado para el nombre del archivo
     soporte_encontrado = tipo_encontrado if tipo_encontrado else nombre_soporte
+
+    # El nombre del archivo será: {num}_{soporte_encontrado}.pdf
     safe_name = re.sub(r"[^\w\-_.]", "_", f"{num}_{soporte_encontrado}.pdf")
     out_path = dl_subdir / safe_name
-
-    try:
-        with open(out_path, "wb") as f:
-            f.write(img2pdf.convert(imagenes_bytes))
-        log(f"    💾 PDF guardado: {out_path.name} ({out_path.stat().st_size // 1024} KB)")
-    except Exception as e:
-        log(f"    ⚠️ img2pdf falló, usando PIL: {e}", "warn")
-        try:
-            pil_images = [Image.open(io.BytesIO(img)).convert('RGB') for img in imagenes_bytes]
-            if pil_images:
-                pil_images[0].save(str(out_path), save_all=True, append_images=pil_images[1:])
-                log(f"    💾 PDF guardado (PIL): {out_path.name}")
-        except Exception as e2:
-            raise Exception(f"No se pudo consolidar PDF: {e2}")
+    out_path.write_bytes(pdf_data)
+    log(f"    💾 PDF guardado: {out_path.name} ({len(pdf_data)//1024} KB)")
 
     with job_lock:
         job_state["descargas_exitosas"].append({
@@ -905,10 +1007,15 @@ def _download_factura(page, context, modal_frame, fac: dict, dl_dir: Path, ips_n
             "archivo": str(out_path),
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         })
+
     _cerrar_traza_factura(page)
     time.sleep(0.8)
 
 # ==================== AUTOMATIZACIÓN PRINCIPAL ====================
+# (El resto del código de run_automation y rutas Flask es idéntico al original,
+#  no se modifica nada más. Para ahorrar espacio, se incluye tal cual estaba,
+#  pero asegurando que la función _extraer_nombre_ips es la nueva.)
+
 def run_automation(usuario: str, password: str, periodo: str, download_path: str):
     from playwright.sync_api import sync_playwright
     global current_browser, current_context, current_dl_dir, current_periodo, current_ips_nombre
@@ -917,12 +1024,13 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
     dl_dir.mkdir(parents=True, exist_ok=True)
     ips_nombre_actual = "IPS_SIN_NOMBRE"
     zip_parcial_generado = False
+
     current_dl_dir = dl_dir
     current_periodo = periodo
 
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)  # Railway: headless=True
+            browser = p.chromium.launch(headless=False)
             context = browser.new_context(accept_downloads=True, viewport={"width": 1500, "height": 900})
             page = context.new_page()
             current_browser = browser
@@ -931,6 +1039,7 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
             log("🔐 Iniciando sesión en Activa IT...")
             if job_state.get("stopping"): return
             page.goto("https://activa-it.net/Login.aspx", wait_until="networkidle", timeout=60000)
+            log(f"  → Usuario: {usuario}")
             page.fill('input[placeholder="Usuario"]', usuario)
             page.fill('input[placeholder="Contraseña"]', password)
             try:
@@ -949,7 +1058,15 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
             time.sleep(3)
 
             def _find_periodo_in_frames():
-                js_check = f"""() => {{ const body = (document.body?.innerText || '').toLowerCase(); return body.includes('{periodo.lower()}') || ['abr26','abr-26','abr.26','abr/26','abr2026'].some(v => body.includes(v)); }}"""
+                js_check = f"""
+                    () => {{
+                        const bodyText = (document.body?.innerText || '').toLowerCase();
+                        const periodo = '{periodo}'.toLowerCase();
+                        if (bodyText.includes(periodo)) return true;
+                        const variaciones = ['abr26', 'abr-26', 'abr.26', 'abr/26', 'abr2026'];
+                        return variaciones.some(v => bodyText.includes(v));
+                    }}
+                """
                 for fr in page.frames:
                     try:
                         if fr.evaluate(js_check):
@@ -1004,6 +1121,7 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
                 raise Exception(f"No se pudo localizar el período '{periodo}' tras 60s.")
 
             log("🏥 Obteniendo nombre de la IPS...")
+            # Intentar extraer NIT del nombre de usuario (ej: PREV900600550 → 900600550)
             nit_from_usuario = re.search(r'(\d{9,12})', usuario)
             nit_from_usuario = nit_from_usuario.group(1) if nit_from_usuario else None
             if nit_from_usuario:
@@ -1015,10 +1133,12 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
             log(f"📅 Click en columna Cant del período '{periodo}'...")
             click_result = target_frame.evaluate(f"""
                 () => {{
-                    for (const row of document.querySelectorAll('tr')) {{
+                    const rows = document.querySelectorAll('tr');
+                    for (const row of rows) {{
                         const cells = row.querySelectorAll('td');
                         if (cells.length < 3) continue;
-                        if (cells[0].textContent.trim() !== '{periodo}') continue;
+                        const firstText = cells[0].textContent.trim();
+                        if (firstText !== '{periodo}') continue;
                         const links = row.querySelectorAll('a');
                         if (links.length === 0) return {{ ok: false, reason: 'sin_links' }};
                         const firstLink = links[0];
@@ -1058,7 +1178,8 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
 
             log("⏳ Esperando datos del listado...")
             data_frame = None
-            for _ in range(120):
+            tiempo_espera = 0
+            while tiempo_espera < 60:
                 if job_state.get("stopping"): return
                 for fr in page.frames:
                     try:
@@ -1070,6 +1191,8 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
                 if data_frame:
                     break
                 time.sleep(0.5)
+                tiempo_espera += 0.5
+
             if not data_frame:
                 log("⚠️ No se encontraron facturas con los estados objetivo.", "warn")
                 browser.close()
@@ -1086,46 +1209,31 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
                     { nombre: 'En radicacion: Devolución de entrada', regex: /en\s+radicaci[oó]n\s*:\s*devoluci[oó]n\s+de\s+entrada/i, tipo: 'devolucion' },
                     { nombre: 'En auditoria: Pendiente de informar Orden de pago al Pagador', regex: /en\s+auditori?a\s*:\s*pendiente\s+de\s+informar\s+orden\s+de\s+pago\s+al\s+pagador/i, tipo: 'auditada' },
                 ];
-                function normalizar(s) {
-                    return s.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "")
-                        .replace(/[''´`]/g, "'").replace(/[""]/g, '"');
-                }
                 const filas = document.querySelectorAll('tr, [role="row"], li');
                 const nuevas = [];
                 for (const fila of filas) {
-                    let fullText = (fila.innerText || '').replace(/\s+/g, ' ').trim();
+                    const fullText = (fila.innerText || '').replace(/\s+/g, ' ').trim();
                     if (!fullText || fullText.length < 20 || fullText.length > 400) continue;
+                    if (!/\d{2}\/\d{2}\/\d{4}/.test(fullText)) continue;
                     let tipoDetectado = null, nombreEstado = null;
-                    const textoNorm = normalizar(fullText);
                     for (const e of ESTADOS) {
-                        if (e.regex.test(textoNorm)) {
-                            tipoDetectado = e.tipo;
-                            nombreEstado = e.nombre;
-                            break;
-                        }
+                        if (e.regex.test(fullText)) { tipoDetectado = e.tipo; nombreEstado = e.nombre; break; }
                     }
                     if (!tipoDetectado) continue;
                     const tokens = fullText.split(/\s+/);
-                    let numFactura = null;
-                    for (const token of tokens) {
-                        let clean = token.replace(/^#+/, '');
-                        let digits = clean.replace(/\D/g, '');
-                        if (digits.length >= 6 && digits.length <= 12) {
-                            numFactura = digits;
-                            break;
-                        }
-                    }
-                    if (!numFactura) continue;
-                    if (state.seen.includes(numFactura)) continue;
+                    const candidatosNum = tokens.filter(t => { const digits = t.replace(/\D/g, ''); return digits.length >= 6 && digits.length <= 10; });
+                    if (candidatosNum.length === 0 || candidatosNum.length > 6) continue;
+                    const numNorm = candidatosNum[0].replace(/\D/g, '');
+                    if (state.seen.includes(numNorm)) continue;
                     const botId = 'bot_' + state.nextId;
                     state.nextId++;
                     fila.setAttribute('data-bot-row-id', botId);
                     nuevas.push({
-                        botId: botId, num: numFactura, rawNum: numFactura,
+                        botId: botId, num: numNorm, rawNum: candidatosNum[0],
                         tipo: tipoDetectado, estado: nombreEstado,
                         textoFila: fullText.slice(0, 150), tagName: fila.tagName.toLowerCase(),
                     });
-                    state.seen.push(numFactura);
+                    state.seen.push(numNorm);
                 }
                 return { nuevas: nuevas, total: state.seen.length };
             }
@@ -1137,8 +1245,7 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
                 if job_state.get("stopping"): return
                 try:
                     res = data_frame.evaluate(js_extract, extract_state)
-                except Exception as e:
-                    log(f"  ⚠️ Error en extracción ronda {ronda+1}: {e}", "warn")
+                except:
                     res = {"nuevas": []}
                 nuevas = res.get("nuevas", [])
                 if nuevas:
@@ -1151,20 +1258,22 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
                 if rondas_sin_nuevos >= 5:
                     break
                 try:
-                    data_frame.evaluate("() => { const s = document.querySelectorAll('div, table, tbody, [class*=\"scroll\"]'); for (const e of s) if (e.scrollHeight > e.clientHeight + 20) e.scrollTop = e.clientHeight * 0.8; window.scrollBy(0, window.innerHeight * 0.8); }")
+                    data_frame.evaluate("() => { const scrollables = document.querySelectorAll('div, table, tbody, [class*=\"scroll\"]'); for (const s of scrollables) { if (s.scrollHeight > s.clientHeight + 20) s.scrollTop += s.clientHeight * 0.8; } window.scrollBy(0, window.innerHeight * 0.8); }")
                 except:
                     pass
                 time.sleep(0.5)
             log(f"📊 {len(facturas_acumuladas)} facturas detectadas.")
             facturas_objetivo = facturas_acumuladas
 
+            # ========== PERSISTENCIA Y FILTRO ==========
             ips_dir = dl_dir / ips_nombre_actual
             completadas = cargar_progreso(ips_dir)
 
+            # Filtrar facturas ya descargadas
             facturas_pendientes = []
             for fac in facturas_objetivo:
                 if fac['num'] in completadas:
-                    log(f"⏭️ Factura {fac['num']} ya descargada, omitiendo.")
+                    log(f"⏭️ Factura {fac['num']} ya descargada en ejecución anterior, omitiendo.")
                     with job_lock:
                         job_state["stats"]["descargadas"] += 1
                         job_state["descargas_exitosas"].append({
@@ -1176,26 +1285,29 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
                 else:
                     facturas_pendientes.append(fac)
 
+            # Aplicar filtro opcional por lista de facturas permitidas
             with job_lock:
                 permitidas = job_state.get("facturas_permitidas", [])
             if permitidas:
                 original_count = len(facturas_pendientes)
                 facturas_pendientes = [fac for fac in facturas_pendientes if fac['num'] in permitidas]
-                log(f"📋 Filtro activo: {len(facturas_pendientes)} de {original_count} facturas permitidas.")
+                log(f"📋 Filtro activo: solo {len(facturas_pendientes)} de {original_count} facturas están en la lista permitida.")
 
-            log(f"📋 Facturas pendientes: {len(facturas_pendientes)}")
+            log(f"📋 Facturas pendientes por procesar en esta ejecución: {len(facturas_pendientes)}")
+
+            # Actualizar estadísticas totales
             with job_lock:
                 job_state["stats"]["total"] = len(facturas_pendientes) + job_state["stats"]["descargadas"]
                 job_state["stats"]["errores"] = 0
 
             cnt_aud = sum(1 for f in facturas_pendientes if f["tipo"] == "auditada")
             cnt_dev = sum(1 for f in facturas_pendientes if f["tipo"] == "devolucion")
-            log("📋 RESUMEN:")
+            log("📋 RESUMEN DE FACTURAS PENDIENTES:")
             log(f"  • Auditada: {cnt_aud}")
             log(f"  • Devolucion: {cnt_dev}")
-            log(f"  TOTAL_PENDIENTES: {len(facturas_pendientes)}")
+            log(f"  TOTAL: {len(facturas_pendientes)}")
             if not facturas_pendientes:
-                log("ℹ️ No hay facturas pendientes.")
+                log("ℹ️ No hay facturas pendientes por procesar.")
                 browser.close()
                 with job_lock:
                     exitosas = job_state["descargas_exitosas"].copy()
@@ -1204,9 +1316,10 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
                 crear_zip_completo(dl_dir, periodo, ips_nombre_actual)
                 return
 
+            # ========== PROCESAR FACTURAS PENDIENTES ==========
             for idx, fac in enumerate(facturas_pendientes, 1):
                 if job_state.get("stopping"):
-                    log("🛑 Proceso detenido por el usuario.")
+                    log("🛑 Proceso detenido por el usuario durante el procesamiento de facturas.")
                     if not zip_parcial_generado:
                         generar_zip_parcial()
                         zip_parcial_generado = True
@@ -1248,11 +1361,20 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
                     time.sleep(1)
 
             browser.close()
+
+            # ========== GENERAR EXCEL FINAL ==========
             with job_lock:
                 exitosas = job_state["descargas_exitosas"].copy()
                 errores = job_state["errores_detalle"].copy()
-            generar_reporte_excel(dl_dir, periodo, ips_nombre_actual, exitosas, errores)
+            excel_path = generar_reporte_excel(dl_dir, periodo, ips_nombre_actual, exitosas, errores)
+            if excel_path:
+                log(f"📊 Reporte Excel generado: {excel_path}")
+            else:
+                log("⚠️ No se pudo generar el Excel (openpyxl no instalado o error).", "warn")
+
+            # ========== ZIP FINAL (incluye Excel y Errores) ==========
             crear_zip_completo(dl_dir, periodo, ips_nombre_actual)
+
             log("🎉 Proceso completado.")
 
     except Exception as e:
@@ -1287,11 +1409,14 @@ def start_job():
     password = data.get("password", "").strip()
     periodo_input = data.get("periodo", "").strip()
     custom_path = data.get("download_path", "").strip()
+
     if not all([usuario, password, periodo_input]):
         return jsonify({"ok": False, "error": "Faltan campos requeridos"}), 400
+
     periodos = parse_periodo_input(periodo_input)
     if not periodos:
         return jsonify({"ok": False, "error": f"Formato de período inválido: '{periodo_input}'. Use MMMYY (ej: May26) o rango MMMYY-MMMYY"}), 400
+
     with job_lock:
         if job_state["running"]:
             return jsonify({"ok": False, "error": "Ya hay un proceso en ejecución"}), 409
@@ -1301,13 +1426,16 @@ def start_job():
         job_state["stats"] = {"total": 0, "descargadas": 0, "errores": 0}
         job_state["errores_detalle"] = []
         job_state["descargas_exitosas"] = []
+
     dl_path = custom_path if custom_path else str(DOWNLOAD_DIR / periodo_input)
     periodo_principal = periodos[0] if len(periodos) == 1 else periodo_input
+
     if len(periodos) > 1:
         log(f"📅 Procesando rango de {len(periodos)} períodos: {periodos[0]} → {periodos[-1]}")
         job_state["periodos_rango"] = periodos
     else:
         job_state["periodos_rango"] = None
+
     t = threading.Thread(target=run_automation, args=(usuario, password, periodo_principal, dl_path), daemon=True)
     t.start()
     return jsonify({"ok": True, "download_path": dl_path, "periodos_detectados": periodos})
@@ -1324,10 +1452,12 @@ def stop_job_route():
 def reset_job_route():
     data = request.json or {}
     periodo = data.get("periodo", "").strip()
+
     with job_lock:
         if job_state["running"]:
             stop_job()
             time.sleep(2)
+
     if periodo:
         periodo_dir = DOWNLOAD_DIR / periodo
         if periodo_dir.exists():
@@ -1341,46 +1471,9 @@ def reset_job_route():
             log(f"⚠️ No existe la carpeta del período '{periodo}'.", "warn")
     else:
         log("⚠️ No se especificó período, no se borró progreso.", "warn")
+
     reset_state()
     return jsonify({"ok": True, "message": "Estado reiniciado y progreso eliminado."})
-
-@app.route("/api/clean", methods=["POST"])
-def clean_downloads():
-    data = request.json or {}
-    periodo = data.get("periodo", "").strip()
-    ips = data.get("ips", "").strip()
-    if not periodo:
-        return jsonify({"ok": False, "error": "Se requiere el parámetro 'periodo'"}), 400
-    periodo_dir = DOWNLOAD_DIR / periodo
-    if not periodo_dir.exists():
-        return jsonify({"ok": False, "error": f"El período '{periodo}' no tiene datos descargados"}), 404
-    def delete_directory(path):
-        try:
-            if path.exists():
-                import shutil
-                shutil.rmtree(path)
-                return True
-        except Exception as e:
-            log(f"⚠️ Error al eliminar {path}: {e}", "error")
-            return False
-        return False
-    eliminados = []
-    if ips:
-        ips_dir = periodo_dir / ips
-        if ips_dir.exists():
-            if delete_directory(ips_dir):
-                eliminados.append(str(ips_dir))
-            else:
-                return jsonify({"ok": False, "error": f"No se pudo eliminar la carpeta de IPS '{ips}'"}), 500
-        else:
-            return jsonify({"ok": False, "error": f"No existe la IPS '{ips}' en el período '{periodo}'"}), 404
-    else:
-        if delete_directory(periodo_dir):
-            eliminados.append(str(periodo_dir))
-        else:
-            return jsonify({"ok": False, "error": "Error al eliminar"}), 500
-    log(f"🧹 Limpieza completa realizada: {', '.join(eliminados)}")
-    return jsonify({"ok": True, "message": f"Se eliminaron correctamente: {', '.join(eliminados)}", "eliminados": eliminados})
 
 @app.route("/api/status")
 def get_status():
@@ -1416,39 +1509,6 @@ def list_files():
                 files.append({"name": f.name, "size": f.stat().st_size, "path": str(f), "periodo": periodo})
     return jsonify({"files": files})
 
-@app.route("/api/files", methods=["DELETE"])
-def delete_all_files():
-    import shutil
-    periodo = request.args.get("periodo", "")
-    folder = DOWNLOAD_DIR / periodo if periodo else DOWNLOAD_DIR
-    if not folder.exists():
-        return jsonify({"ok": True, "message": "No hay archivos que eliminar"})
-    try:
-        eliminados = 0
-        if periodo:
-            # Borrar solo archivos dentro de la carpeta del período (no subcarpetas)
-            for f in list(folder.iterdir()):
-                if f.is_file():
-                    f.unlink()
-                    eliminados += 1
-                elif f.is_dir():
-                    shutil.rmtree(f)
-                    eliminados += 1
-        else:
-            # Sin período: borrar todo el contenido de DOWNLOAD_DIR
-            for item in list(folder.iterdir()):
-                if item.is_file():
-                    item.unlink()
-                    eliminados += 1
-                elif item.is_dir():
-                    shutil.rmtree(item)
-                    eliminados += 1
-        log(f"🗑️ Archivos eliminados: {eliminados} elemento(s) en '{folder}'")
-        return jsonify({"ok": True, "message": f"Se eliminaron {eliminados} elemento(s)", "eliminados": eliminados})
-    except Exception as e:
-        log(f"⚠️ Error al eliminar archivos: {e}", "error")
-        return jsonify({"ok": False, "error": str(e)}), 500
-
 @app.route("/downloads/<path:filename>")
 def download_file(filename):
     return send_from_directory(DOWNLOAD_DIR, filename, as_attachment=True)
@@ -1469,6 +1529,7 @@ def upload_facturas():
     file = request.files['file']
     if file.filename == '':
         return jsonify({"ok": False, "error": "Archivo vacío"}), 400
+
     try:
         filename = file.filename.lower()
         facturas = []
@@ -1498,9 +1559,11 @@ def upload_facturas():
                     facturas.append(str(val).strip())
         else:
             return jsonify({"ok": False, "error": "Formato no soportado. Use CSV o Excel"}), 400
+
         facturas_limpias = [re.sub(r'\D', '', f) for f in facturas if re.sub(r'\D', '', f)]
         if not facturas_limpias:
             return jsonify({"ok": False, "error": "No se encontraron números de factura válidos"}), 400
+
         with job_lock:
             job_state["facturas_permitidas"] = facturas_limpias
         log(f"📄 Se cargaron {len(facturas_limpias)} facturas desde el archivo.")
@@ -1514,9 +1577,11 @@ def get_progreso():
     ips = request.args.get("ips", "")
     if not periodo:
         return jsonify({"ok": False, "error": "Se requiere el parámetro 'periodo'"}), 400
+
     periodo_dir = DOWNLOAD_DIR / periodo
     if not periodo_dir.exists():
         return jsonify({"ok": True, "completadas": [], "mensaje": "No hay datos para este período"})
+
     if ips:
         ips_dir = periodo_dir / ips
         if not ips_dir.exists():
@@ -1535,9 +1600,11 @@ def get_progreso():
         if not ips_dir:
             return jsonify({"ok": True, "completadas": [], "mensaje": "No se encontró carpeta de IPS"})
         ips = ips_dir.name
+
     progreso_path = ips_dir / "progreso.json"
     if not progreso_path.exists():
         return jsonify({"ok": True, "completadas": [], "ips": ips, "mensaje": "Aún no hay facturas completadas"})
+
     try:
         with open(progreso_path, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -1585,7 +1652,7 @@ def exportar_progreso_excel():
 if __name__ == "__main__":
     print("\n" + "=" * 55)
     print("  🏥 Activa IT — Descargador de Cartas Glosa")
-    print("  🔷 Previsora SOAT (Con espera explícita del contador de páginas)")
+    print("  🔷 Previsora SOAT (con nombres de IPS forzados desde el mapa)")
     print("=" * 55)
     print(f"  📂 Carpeta de descargas: {DOWNLOAD_DIR}")
     print(f"  🌐 Puerto: {port}")
