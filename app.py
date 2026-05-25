@@ -1416,6 +1416,39 @@ def list_files():
                 files.append({"name": f.name, "size": f.stat().st_size, "path": str(f), "periodo": periodo})
     return jsonify({"files": files})
 
+@app.route("/api/files", methods=["DELETE"])
+def delete_all_files():
+    import shutil
+    periodo = request.args.get("periodo", "")
+    folder = DOWNLOAD_DIR / periodo if periodo else DOWNLOAD_DIR
+    if not folder.exists():
+        return jsonify({"ok": True, "message": "No hay archivos que eliminar"})
+    try:
+        eliminados = 0
+        if periodo:
+            # Borrar solo archivos dentro de la carpeta del período (no subcarpetas)
+            for f in list(folder.iterdir()):
+                if f.is_file():
+                    f.unlink()
+                    eliminados += 1
+                elif f.is_dir():
+                    shutil.rmtree(f)
+                    eliminados += 1
+        else:
+            # Sin período: borrar todo el contenido de DOWNLOAD_DIR
+            for item in list(folder.iterdir()):
+                if item.is_file():
+                    item.unlink()
+                    eliminados += 1
+                elif item.is_dir():
+                    shutil.rmtree(item)
+                    eliminados += 1
+        log(f"🗑️ Archivos eliminados: {eliminados} elemento(s) en '{folder}'")
+        return jsonify({"ok": True, "message": f"Se eliminaron {eliminados} elemento(s)", "eliminados": eliminados})
+    except Exception as e:
+        log(f"⚠️ Error al eliminar archivos: {e}", "error")
+        return jsonify({"ok": False, "error": str(e)}), 500
+
 @app.route("/downloads/<path:filename>")
 def download_file(filename):
     return send_from_directory(DOWNLOAD_DIR, filename, as_attachment=True)
