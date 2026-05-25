@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 FROM python:3.11-slim
 
-# Instalar dependencias del sistema para Playwright y Chromium
+# Dependencias del sistema para Chromium/Playwright
 RUN apt-get update && apt-get install -y \
     libnss3 \
     libnspr4 \
@@ -20,7 +20,11 @@ RUN apt-get update && apt-get install -y \
     libasound2 \
     libatspi2.0-0 \
     libxshmfence1 \
+    libx11-6 \
+    libxcb1 \
+    libxext6 \
     fonts-liberation \
+    fonts-unifont \
     libfontconfig1 \
     libfreetype6 \
     wget \
@@ -35,11 +39,10 @@ WORKDIR /app
 
 COPY requirements.txt .
 
-# Instalar dependencias Python
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Instalar Chromium en ruta fija (evita conflictos de versión en cache)
-RUN python -m playwright install --with-deps chromium
+# Sin --with-deps porque ya instalamos las dependencias arriba manualmente
+RUN python -m playwright install chromium
 
 COPY . .
 
