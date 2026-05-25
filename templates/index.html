@@ -3,6 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<link rel="icon" type="image/x-icon" href="/static/favicon.ico">
 <title>Activa IT — Descargador Cartas Glosa Previsora</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
@@ -43,15 +44,19 @@
     z-index: 50;
   }
   .header-icon {
-    width: 36px;
-    height: 36px;
-    background: linear-gradient(135deg, var(--accent), #6366f1);
-    border-radius: 10px;
+    width: 44px;
+    height: 44px;
+    border-radius: 8px;
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 1.1rem;
-    box-shadow: 0 2px 8px rgba(79, 70, 229, 0.25);
+    overflow: hidden;
+    background: transparent;
+  }
+  .header-icon img {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
   }
   header h1 { font-size: 1rem; font-weight: 700; color: var(--text-primary); }
   header p { font-size: 0.7rem; color: var(--text-secondary); }
@@ -599,7 +604,7 @@
 <body>
 
 <header>
-  <div class="header-icon">🏥</div>
+  <div class="header-icon"><img src="/static/logo.png" alt="SIS Logo"></div>
   <div>
     <h1>Descargador Cartas Glosa — Previsora SOAT</h1>
     <p>Activa IT · Automatización de descarga de archivos soporte</p>
