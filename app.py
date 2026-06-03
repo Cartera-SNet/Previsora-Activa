@@ -42,8 +42,8 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 BASE_DIR = Path(__file__).parent
-port = int(os.environ.get("PORT", 5050))
-DOWNLOAD_DIR = BASE_DIR / f"downloads_{port}"
+port = int(os.environ.get("PORT", 8080))
+DOWNLOAD_DIR = BASE_DIR / "downloads"
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 # ==================== MAPA DE IPS POR NIT ====================
@@ -1519,16 +1519,20 @@ def delete_all_files():
     try:
         eliminados = 0
         for item in list(folder.iterdir()):
-            if item.is_file():
+            if item.is_file() and item.name != "progreso.json":
                 item.unlink()
                 eliminados += 1
             elif item.is_dir():
-                shutil.rmtree(item)
-                eliminados += 1
-        log(f"🗑️ Archivos eliminados: {eliminados} elemento(s) en '{folder}'")
-        return jsonify({"ok": True, "message": f"Se eliminaron {eliminados} elemento(s)", "eliminados": eliminados})
+                # Dentro de subcarpetas: borrar archivos pero conservar progreso.json
+                for sub in list(item.iterdir()):
+                    if sub.is_file() and sub.name != "progreso.json":
+                        sub.unlink()
+                        eliminados += 1
+                # Si la subcarpeta quedó vacía (o solo tiene progreso), dejarla
+        log(f"🗑️ Soportes eliminados: {eliminados} archivo(s) en '{folder}' (progreso conservado)")
+        return jsonify({"ok": True, "message": f"Se eliminaron {eliminados} soporte(s). El progreso se conservó.", "eliminados": eliminados})
     except Exception as e:
-        log(f"⚠️ Error al eliminar archivos: {e}", "error")
+        log(f"⚠️ Error al eliminar soportes: {e}", "error")
         return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.route("/downloads/<path:filename>")
@@ -1556,8 +1560,17 @@ def upload_facturas():
         filename = file.filename.lower()
         facturas = []
         if filename.endswith('.csv'):
-            content = file.read().decode('utf-8')
-            reader = csv.DictReader(content.splitlines())
+            raw = file.read()
+            # Detectar encoding: utf-8-sig cubre BOM, latin-1 cubre Windows
+            for enc in ('utf-8-sig', 'utf-8', 'latin-1', 'cp1252'):
+                try:
+                    csv_text = raw.decode(enc)
+                    break
+                except (UnicodeDecodeError, LookupError):
+                    continue
+            else:
+                csv_text = raw.decode('latin-1', errors='replace')
+            reader = csv.DictReader(csv_text.splitlines())
             for row in reader:
                 for col, val in row.items():
                     if 'factura' in col.lower():

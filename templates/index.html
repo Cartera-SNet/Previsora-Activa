@@ -749,7 +749,7 @@
         <span class="icon"><i class="fas fa-folder-open"></i></span> Archivos descargados
         <div style="display:flex;gap:6px;align-items:center;">
           <button onclick="refreshFiles()" class="btn-clear" title="Actualizar">↻</button>
-          <button onclick="deleteAllFiles()" class="btn-clear" title="Borrar todos los archivos" style="color:#e74c3c;font-size:14px;">🗑</button>
+          <button onclick="deleteAllFiles()" class="btn-clear" title="Borrar soportes (conserva progreso)" style="color:#e74c3c;font-size:14px;">🗑</button>
         </div>
       </div>
       <div class="card-body" style="padding:8px;">
@@ -1021,7 +1021,7 @@ function escHtml(s) {
 async function deleteAllFiles() {
     const periodo = document.getElementById("periodoCustom").value.trim();
     const label = periodo ? `del período "${periodo}"` : "de la carpeta de descargas";
-    if (!confirm(`¿Borrar todos los archivos ${label}?\n\nEsta acción no se puede deshacer.`)) return;
+    if (!confirm(`¿Borrar soportes ${label}?\n\nSe eliminarán los PDFs/ZIPs descargados.\nEl progreso de descarga se conservará.`)) return;
     const resp = await fetch(`/api/files?periodo=${encodeURIComponent(periodo)}`, { method: "DELETE" });
     const data = await resp.json();
     if (data.ok) {
