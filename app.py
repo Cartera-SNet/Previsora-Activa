@@ -803,7 +803,7 @@ def _download_factura(page, context, modal_frame, fac: dict, dl_dir: Path, ips_n
         if archivo_seleccionado:
             break
         log(f"    🔄 Reintentando selección ({intento+1}/4)...")
-        time.sleep(2)
+        time.sleep(0.8)
 
     # ---------- SEGUNDA BÚSQUEDA: CARTA DE OBJECIÓN (si no se encontró Envios_D/ActaDevolucion) ----------
     if not archivo_seleccionado:
@@ -1050,12 +1050,14 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
                 pass
             page.click('button:has-text("Inicio de sesión"), input[value="Inicio de sesión"]')
             page.wait_for_url("**/Index.aspx", timeout=60000)
-            time.sleep(2)
+            try:
+                page.wait_for_selector("text=BI IPS, text=Inteligencia de Negocio", timeout=10000)
+            except:
+                pass
             log("✅ Sesión iniciada correctamente.")
             if job_state.get("stopping"): return
 
             log("📂 Navegando a módulo BI IPS...")
-            time.sleep(3)
 
             def _find_periodo_in_frames():
                 js_check = f"""
@@ -1107,7 +1109,10 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
             if not clicked:
                 raise Exception("No se encontró el módulo BI IPS en el menú.")
 
-            time.sleep(3)
+            try:
+                page.wait_for_load_state("networkidle", timeout=8000)
+            except:
+                pass
             log("✅ Módulo BI IPS abierto. Buscando período...")
             target_frame = None
             for i in range(120):
@@ -1352,7 +1357,7 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
                 return fallidas
 
             # ── Primer pase ──
-            MAX_REINTENTOS = 5
+            MAX_REINTENTOS = 8
             fallidas = _procesar_lista(facturas_pendientes, 1)
 
             # ── Reintentos automáticos ──
@@ -1360,17 +1365,83 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
                 browser.close()
                 return
 
+            def _relogin_y_procesar(fallidas_lista, intento_num, espera_seg):
+                """Cierra browser, espera, hace login completo y reintenta solo las fallidas."""
+                nonlocal page, context, browser
+                log(f"🔒 Cerrando browser para reinicio completo (intento {intento_num}/{MAX_REINTENTOS})...", "warn")
+                try:
+                    browser.close()
+                except:
+                    pass
+                log(f"⏳ Esperando {espera_seg//60} minuto(s) antes de reiniciar...", "warn")
+                for _ in range(espera_seg):
+                    if job_state.get("stopping"):
+                        return None
+                    time.sleep(1)
+                log(f"🔄 Reiniciando browser y sesión (intento {intento_num}/{MAX_REINTENTOS})...", "warn")
+                # Reutilizar el playwright (p) ya existente — no crear uno nuevo dentro del hilo
+                browser = p.chromium.launch(headless=True)
+                context = browser.new_context(accept_downloads=True, viewport={"width": 1500, "height": 900})
+                page = context.new_page()
+                # Login completo
+                page.goto("https://activa-it.net/Login.aspx", wait_until="networkidle", timeout=60000)
+                page.fill('input[placeholder="Usuario"]', usuario)
+                page.fill('input[placeholder="Contraseña"]', password)
+                try:
+                    checkbox = page.locator('input[type="checkbox"]').first
+                    if not checkbox.is_checked():
+                        checkbox.check()
+                except:
+                    pass
+                page.click('button:has-text("Inicio de sesión"), input[value="Inicio de sesión"]')
+                page.wait_for_url("**/Index.aspx", timeout=60000)
+                try:
+                    page.wait_for_selector("text=BI IPS, text=Inteligencia de Negocio", timeout=10000)
+                except:
+                    pass
+                log("✅ Sesión reiniciada correctamente.")
+                # Navegar al módulo
+                for _ in range(3):
+                    try:
+                        page.click("text=Inteligencia de Negocio", timeout=8000)
+                        time.sleep(1)
+                        page.click("text=BI IPS", timeout=8000)
+                        break
+                    except:
+                        time.sleep(2)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=8000)
+                except:
+                    pass
+                # Limpiar errores anteriores y procesar
+                nums_fallidas = {f['num'] for f in fallidas_lista}
+                with job_lock:
+                    job_state["errores_detalle"] = [e for e in job_state["errores_detalle"] if e["factura"] not in nums_fallidas]
+                return _procesar_lista(fallidas_lista, intento_num)
+
             intento = 2
             while fallidas and intento <= MAX_REINTENTOS and not job_state.get("stopping"):
-                log(f"🔄 {len(fallidas)} factura(s) con error. Reintentando automáticamente ({intento}/{MAX_REINTENTOS})...", "warn")
-                time.sleep(3)
-                # Limpiar errores anteriores de esas facturas para no duplicar en el reporte
                 nums_fallidas = {f['num'] for f in fallidas}
                 with job_lock:
                     job_state["errores_detalle"] = [e for e in job_state["errores_detalle"] if e["factura"] not in nums_fallidas]
-                fallidas_nuevo = _procesar_lista(fallidas, intento)
+
+                if intento <= 4:
+                    # Intentos 2-4: reintento rápido sin cerrar browser
+                    log(f"🔄 {len(fallidas)} factura(s) con error. Reintentando sin cerrar sesión ({intento}/{MAX_REINTENTOS})...", "warn")
+                    time.sleep(3)
+                    fallidas_nuevo = _procesar_lista(fallidas, intento)
+                else:
+                    # Intentos 5-7: esperar 5 min | Intento 8: esperar 10 min
+                    espera = 600 if intento == MAX_REINTENTOS else 300
+                    mins = espera // 60
+                    log(f"🔄 {len(fallidas)} factura(s) persisten. Reiniciando sesión completa ({intento}/{MAX_REINTENTOS}) — espera {mins} min...", "warn")
+                    fallidas_nuevo = _relogin_y_procesar(fallidas, intento, espera_seg=espera)
+
                 if fallidas_nuevo is None:
-                    browser.close()
+                    try:
+                        browser.close()
+                    except:
+                        pass
                     return
                 fallidas = fallidas_nuevo
                 intento += 1
