@@ -520,28 +520,51 @@ def _download_factura(page, context, modal_frame, fac: dict, dl_dir: Path, ips_n
         () => {{
             const botId = '{bot_id}';
             const targetDigits = '{num_solo_digitos}';
-            const fila = document.querySelector(`[data-bot-row-id="${{botId}}"]`);
-            if (!fila) return {{ ok: false, reason: "fila_no_encontrada" }};
-            fila.scrollIntoView({{block: 'center'}});
+
             function dispararClick(el) {{
                 if (!el) return false;
                 try {{ el.click(); }} catch (e) {{}}
                 try {{ el.dispatchEvent(new MouseEvent('click', {{bubbles: true, cancelable: true, view: window}})); }} catch (e) {{}}
                 return true;
             }}
-            const candidatos = [];
-            for (const a of fila.querySelectorAll('a')) {{
-                const t = (a.textContent || '').trim();
-                if (t.replace(/\\D/g, '') === targetDigits || candidatos.length === 0)
-                    candidatos.push({{ tipo: 'a', el: a }});
+
+            function clickearFila(fila, metodo) {{
+                fila.scrollIntoView({{block: 'center'}});
+                const candidatos = [];
+                for (const a of fila.querySelectorAll('a')) {{
+                    const t = (a.textContent || '').trim();
+                    if (t.replace(/\\D/g, '') === targetDigits || candidatos.length === 0)
+                        candidatos.push(a);
+                }}
+                for (const el of fila.querySelectorAll('[onclick]')) {{
+                    if (!candidatos.includes(el)) candidatos.push(el);
+                }}
+                candidatos.push(fila);
+                for (const td of fila.querySelectorAll('td')) candidatos.push(td);
+                for (const c of candidatos) dispararClick(c);
+                return {{ ok: true, clickedWith: metodo, candidates: candidatos.length }};
             }}
-            for (const el of fila.querySelectorAll('[onclick]')) {{
-                if (!candidatos.find(c => c.el === el)) candidatos.push({{ tipo: 'onclick', el }});
+
+            let fila = botId ? document.querySelector(`[data-bot-row-id="${{botId}}"]`) : null;
+            if (fila) return clickearFila(fila, 'botId');
+
+            for (const row of document.querySelectorAll('tr')) {{
+                for (const a of row.querySelectorAll('a')) {{
+                    if ((a.textContent || '').replace(/\\D/g, '') === targetDigits) {{
+                        return clickearFila(row, 'numero_factura');
+                    }}
+                }}
             }}
-            candidatos.push({{ tipo: 'fila', el: fila }});
-            for (const td of fila.querySelectorAll('td')) candidatos.push({{ tipo: 'td', el: td }});
-            for (const c of candidatos) dispararClick(c.el);
-            return {{ ok: true, clickedWith: 'cascada', candidates: candidatos.length }};
+
+            for (const row of document.querySelectorAll('tr')) {{
+                for (const td of row.querySelectorAll('td')) {{
+                    if ((td.textContent || '').replace(/\\D/g, '') === targetDigits) {{
+                        return clickearFila(row, 'celda_numero');
+                    }}
+                }}
+            }}
+
+            return {{ ok: false, reason: "fila_no_encontrada" }};
         }}
     """
     result = None
@@ -1341,10 +1364,9 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
                         guardar_progreso(ips_dir, completadas)
                         log(f"  ✅ Descargada: {fac['num']}", "success")
                     except Exception as e:
+                        error_msg = str(e)
+                        es_definitivo = "no encontrada en el sistema" in error_msg
                         with job_lock:
-                            if intento_num == 1:
-                                job_state["stats"]["errores"] += 1
-                            error_msg = str(e)
                             if "No se pudo seleccionar el archivo" in error_msg:
                                 if fac['tipo'] == 'auditada':
                                     error_msg = f"En la factura {fac['num']} no se encontró soporte Envios_D ni Carta de Objecion"
@@ -1353,7 +1375,24 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
                         log(f"  ⚠️ Error intento {intento_num}: {error_msg}", "error")
                         _cerrar_traza_factura(page)
                         time.sleep(1)
-                        fallidas.append(fac)
+                        if es_definitivo:
+                            with job_lock:
+                                nums_existentes = {er["factura"] for er in job_state["errores_detalle"]}
+                                if fac['num'] not in nums_existentes:
+                                    job_state["stats"]["errores"] += 1
+                                    job_state["errores_detalle"].append({
+                                        "factura": fac['num'],
+                                        "estado": fac['estado'],
+                                        "error": "Factura no existe en el sistema (No se encontraron registros)",
+                                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                        "captura": ""
+                                    })
+                            log(f"  ⏭️ Factura {fac['num']} marcada como inexistente — no se reintentará.", "warn")
+                        else:
+                            with job_lock:
+                                if intento_num == 1:
+                                    job_state["stats"]["errores"] += 1
+                            fallidas.append(fac)
                 return fallidas
 
             # ── Primer pase ──
@@ -1400,7 +1439,7 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
                 except:
                     pass
                 log("✅ Sesión reiniciada correctamente.")
-                # Navegar al módulo
+                # Navegar al módulo BI IPS
                 for _ in range(3):
                     try:
                         page.click("text=Inteligencia de Negocio", timeout=8000)
@@ -1413,6 +1452,67 @@ def run_automation(usuario: str, password: str, periodo: str, download_path: str
                     page.wait_for_load_state("networkidle", timeout=8000)
                 except:
                     pass
+
+                # ── Reconstruir el listado de facturas (data_frame nuevo) ──
+                nonlocal data_frame
+                log("🔄 Reabriendo listado de facturas tras relogin...", "warn")
+                target_frame_re = None
+                for _ in range(120):
+                    if job_state.get("stopping"): return None
+                    for fr in page.frames:
+                        try:
+                            if fr.evaluate(f"() => {{ for (const row of document.querySelectorAll('tr')) {{ const c = row.querySelectorAll('td'); if (c.length >= 3 && c[0].textContent.trim() === '{periodo}') return true; }} return false; }}"):
+                                target_frame_re = fr
+                                break
+                        except:
+                            continue
+                    if target_frame_re:
+                        break
+                    time.sleep(0.5)
+                if not target_frame_re:
+                    log("⚠️ No se pudo reabrir el período tras relogin.", "error")
+                    return fallidas_lista
+
+                try:
+                    target_frame_re.evaluate(f"""
+                        () => {{
+                            for (const row of document.querySelectorAll('tr')) {{
+                                const cells = row.querySelectorAll('td');
+                                if (cells.length < 3) continue;
+                                if (cells[0].textContent.trim() !== '{periodo}') continue;
+                                const links = row.querySelectorAll('a');
+                                if (links.length === 0) return;
+                                links[0].scrollIntoView({{block: 'center'}});
+                                links[0].click();
+                                return;
+                            }}
+                        }}
+                    """)
+                except:
+                    pass
+
+                time.sleep(2)
+                nuevo_data = None
+                for _ in range(120):
+                    if job_state.get("stopping"): return None
+                    for fr in page.frames:
+                        try:
+                            if fr.evaluate("() => /Pendiente de recibir Informaci|Devoluci[oó]n de entrada/i.test(document.body?.innerText || '')"):
+                                nuevo_data = fr
+                                break
+                        except:
+                            continue
+                    if nuevo_data:
+                        break
+                    time.sleep(0.5)
+                if nuevo_data:
+                    data_frame = nuevo_data
+                    log("✅ Listado reabierto correctamente.")
+                    time.sleep(2)
+                else:
+                    log("⚠️ No se pudo reabrir el listado tras relogin.", "error")
+                    return fallidas_lista
+
                 # Limpiar errores anteriores y procesar
                 nums_fallidas = {f['num'] for f in fallidas_lista}
                 with job_lock:
