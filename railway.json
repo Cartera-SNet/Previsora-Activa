@@ -1,3 +1,14 @@
 {
-  "sleepApplication": true
+  "build": {
+    "builder": "DOCKERFILE",
+    "dockerfilePath": "Dockerfile"
+  },
+  "deploy": {
+    "numReplicas": 1,
+    "sleepApplication": true,
+    "RestartPolicy": {
+      "type": "ON_FAILURE",
+      "maxRetries": 3
+    }
+  }
 }
